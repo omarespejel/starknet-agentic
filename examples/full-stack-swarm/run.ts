@@ -167,6 +167,48 @@ function parseToolTextJson(toolResponse: any): any {
   }
 }
 
+function extractTransactionHash(payload: any): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const candidate =
+    payload.transactionHash ??
+    payload.transaction_hash ??
+    payload.txHash ??
+    payload.tx_hash ??
+    null;
+  if (typeof candidate !== "string" || !candidate.startsWith("0x")) return null;
+  return num.toHex(BigInt(candidate));
+}
+
+function txExplorerUrl(network: string, txHash: string | null): string | null {
+  if (!txHash) return null;
+  const base = network === "sepolia" ? "https://sepolia.voyager.online/tx/" : null;
+  return base ? `${base}${txHash}` : null;
+}
+
+function multiplyDecimalString(input: string, factor: bigint): string {
+  if (!/^\d+(\.\d+)?$/.test(input)) {
+    throw new Error(`Invalid decimal amount format: ${input}`);
+  }
+  const [intPart, fracPart = ""] = input.split(".");
+  const scale = 10n ** BigInt(fracPart.length);
+  const integer = BigInt(intPart || "0");
+  const fractional = fracPart.length > 0 ? BigInt(fracPart) : 0n;
+  const scaled = integer * scale + fractional;
+  const multiplied = scaled * factor;
+  const outInt = multiplied / scale;
+  const outFracRaw = (multiplied % scale).toString().padStart(fracPart.length, "0");
+  const outFrac = outFracRaw.replace(/0+$/, "");
+  return outFrac.length > 0 ? `${outInt.toString()}.${outFrac}` : outInt.toString();
+}
+
+function withProcessEnv(overrides: Record<string, string>): Record<string, string> {
+  const base: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (typeof value === "string") base[key] = value;
+  }
+  return { ...base, ...overrides };
+}
+
 class McpSidecar {
   private client: Client | null = null;
   constructor(
@@ -181,7 +223,7 @@ class McpSidecar {
     const transport = new StdioClientTransport({
       command: "node",
       args: [mcpEntry],
-      env: { ...process.env, ...this.env },
+      env: withProcessEnv(this.env),
     });
 
     const client = new Client(
@@ -201,7 +243,7 @@ class McpSidecar {
     if (!this.client) throw new Error("MCP client not connected");
     const res = await this.client.callTool({ name, arguments: args });
     if (res?.isError) {
-      const msg = res?.content?.[0]?.text || `Tool error: ${name}`;
+      const msg = (res as any)?.content?.[0]?.text || `Tool error: ${name}`;
       throw new Error(msg);
     }
     return res;
@@ -360,6 +402,10 @@ async function main() {
   const sellToken = required("SELL_TOKEN");
   const buyToken = required("BUY_TOKEN");
   const amount = required("AMOUNT");
+  const denyAmountMultiplier = BigInt(envInt("DENY_AMOUNT_MULTIPLIER", 10));
+  if (denyAmountMultiplier <= 1n) {
+    throw new Error("DENY_AMOUNT_MULTIPLIER must be > 1");
+  }
   const slippage = Number(envString("SLIPPAGE", "0.01"));
 
   const maxCalls = envInt("MAX_CALLS", 25);
@@ -418,6 +464,7 @@ async function main() {
   const deployer = new Account({ provider, address: deployerAddress, signer: deployerPrivateKey });
 
   const statePath = path.join(SCRIPT_DIR, "state.json");
+  const reportPath = path.resolve(SCRIPT_DIR, envString("REPORT_PATH", "report.json")!);
   let state: any | null = null;
   if (resume && fs.existsSync(statePath)) {
     state = JSON.parse(fs.readFileSync(statePath, "utf8"));
@@ -524,22 +571,28 @@ async function main() {
         });
         try {
           await sidecar.connect();
+          let registerAgentTxHash: string | null = null;
+          let setAgentIdTxHash: string | null = null;
+          let registerSessionKeyTxHash: string | null = null;
+          let setSpendingPolicyTxHash: string | null = null;
 
           if (!agent.agentId) {
             const tokenUri = `${tokenUriBase}${tokenUriBase.includes("?") ? "&" : "?"}agent=${agent.id}`;
             const reg = parseToolTextJson(
               await sidecar.callTool("starknet_register_agent", { token_uri: tokenUri, gasfree: gasfreeOwner }),
             );
+            registerAgentTxHash = extractTransactionHash(reg);
             agent.agentId = reg.agentId ?? null;
           }
 
           if (agent.agentId) {
-            await sidecar.callTool("starknet_invoke_contract", {
+            const setAgentId = parseToolTextJson(await sidecar.callTool("starknet_invoke_contract", {
               contractAddress: agent.sessionAccountAddress,
               entrypoint: "set_agent_id",
               calldata: [String(agent.agentId)],
               gasfree: gasfreeOwner,
-            });
+            }));
+            setAgentIdTxHash = extractTransactionHash(setAgentId);
           }
 
           // Register session key (empty whitelist => allow all non-admin selectors)
@@ -563,19 +616,20 @@ async function main() {
           }
           if (!agent.sessionKeyRegistered) {
             const validUntil = Math.floor(Date.now() / 1000) + sessionKeyLifetimeSeconds;
-            await sidecar.callTool("starknet_invoke_contract", {
+            const sessionRegister = parseToolTextJson(await sidecar.callTool("starknet_invoke_contract", {
               contractAddress: agent.sessionAccountAddress,
               entrypoint: "add_or_update_session_key",
               calldata: [agent.sessionPublicKey, String(validUntil), String(maxCalls), "0"],
               gasfree: gasfreeOwner,
-            });
+            }));
+            registerSessionKeyTxHash = extractTransactionHash(sessionRegister);
             agent.sessionKeyRegistered = true;
           }
 
           // Spending policy for the sell token (per-call + per-window)
           const [maxPerCallLow, maxPerCallHigh] = toU256Calldata(maxPerCallRaw);
           const [maxPerWindowLow, maxPerWindowHigh] = toU256Calldata(maxPerWindowRaw);
-          await sidecar.callTool("starknet_invoke_contract", {
+          const spendingPolicy = parseToolTextJson(await sidecar.callTool("starknet_invoke_contract", {
             contractAddress: agent.sessionAccountAddress,
             entrypoint: "set_spending_policy",
             calldata: [
@@ -588,9 +642,25 @@ async function main() {
               String(windowSeconds),
             ],
             gasfree: gasfreeOwner,
-          });
+          }));
+          setSpendingPolicyTxHash = extractTransactionHash(spendingPolicy);
 
-          return { agent: agent.id, ok: true, agentId: agent.agentId, sessionPublicKey: agent.sessionPublicKey };
+          return {
+            agent: agent.id,
+            ok: true,
+            agentId: agent.agentId,
+            sessionPublicKey: agent.sessionPublicKey,
+            txs: {
+              registerAgent: registerAgentTxHash,
+              registerAgentExplorer: txExplorerUrl(network, registerAgentTxHash),
+              setAgentId: setAgentIdTxHash,
+              setAgentIdExplorer: txExplorerUrl(network, setAgentIdTxHash),
+              registerSessionKey: registerSessionKeyTxHash,
+              registerSessionKeyExplorer: txExplorerUrl(network, registerSessionKeyTxHash),
+              setSpendingPolicy: setSpendingPolicyTxHash,
+              setSpendingPolicyExplorer: txExplorerUrl(network, setSpendingPolicyTxHash),
+            },
+          };
         } catch (e) {
           return { agent: agent.id, ok: false, error: e instanceof Error ? e.message : String(e) };
         } finally {
@@ -705,25 +775,43 @@ async function main() {
               ...(paymasterFeeMode === "default" ? { gasToken: paymasterGasToken } : {}),
             }),
           );
+          const swapTxHash = extractTransactionHash(swap);
 
           // Prove policy denial by exceeding per-call cap.
-          // Keep it deterministic: use a raw amount multiplier.
+          // Keep it deterministic and precision-safe by scaling decimal string.
+          const denyAmount = multiplyDecimalString(amount, denyAmountMultiplier);
           let deniedByPolicy: boolean | null = null;
+          let denialError: string | null = null;
           try {
             await sidecar.callTool("starknet_swap", {
               sellToken,
               buyToken,
-              amount: String(Number(amount) * 10),
+              amount: denyAmount,
               slippage,
               gasfree: gasfreeSwap,
               ...(paymasterFeeMode === "default" ? { gasToken: paymasterGasToken } : {}),
             });
             deniedByPolicy = false;
-          } catch {
+          } catch (error) {
             deniedByPolicy = true;
+            denialError = error instanceof Error ? error.message : String(error);
           }
 
-          return { agent: agent.id, ok: true, balances, quote, swap, deniedByPolicy };
+          return {
+            agent: agent.id,
+            ok: true,
+            balances,
+            quote,
+            swap,
+            swapTxHash,
+            swapExplorer: txExplorerUrl(network, swapTxHash),
+            denialAttempt: {
+              originalAmount: amount,
+              attemptedAmount: denyAmount,
+              deniedByPolicy,
+              error: denialError,
+            },
+          };
         } catch (e) {
           return { agent: agent.id, ok: false, error: e instanceof Error ? e.message : String(e) };
         } finally {
@@ -760,12 +848,26 @@ async function main() {
       maxPerWindowRaw: String(maxPerWindowRaw),
       windowSeconds,
       maxCalls,
+      denyAmountMultiplier: denyAmountMultiplier.toString(),
+    },
+    evidence: {
+      ownerConfigured: ownerResults.filter((r: any) => r.ok).length,
+      swapsSucceeded: tradeResults.filter((r: any) => r.ok && r.swapTxHash).length,
+      denyChecksPassed: tradeResults.filter((r: any) => r.ok && r.denialAttempt?.deniedByPolicy === true).length,
+      denyChecksFailed: tradeResults.filter((r: any) => r.ok && r.denialAttempt?.deniedByPolicy === false).length,
+      swapTransactions: tradeResults
+        .filter((r: any) => r.ok && r.swapTxHash)
+        .map((r: any) => ({ agent: r.agent, txHash: r.swapTxHash, explorer: r.swapExplorer })),
     },
     ownerConfig: ownerResults,
     results: tradeResults,
     stateFile: statePath,
+    reportFile: reportPath,
     sisna: { started: Boolean(sisna), proxyUrl },
   };
+
+  fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+  try { fs.chmodSync(reportPath, 0o600); } catch {}
 
   console.log(JSON.stringify(report, null, 2));
 

@@ -16,6 +16,7 @@ One run produces:
 - 5 ERC-8004 agent IDs minted via `starknet_register_agent`
 - 5 AVNU swaps executed via MCP tools in **proxy signer mode**
 - a deliberate “oversized swap” attempt that gets **denied on-chain** by spending policy
+- `report.json` artifact with tx hashes + Voyager links + deny-path evidence
 
 ## Setup
 
@@ -62,7 +63,12 @@ Signer provider options:
 pnpm --filter @starknet-agentic/full-stack-swarm-example run
 ```
 
-The script writes a local `state.json` (contains keys; do not share) and prints a JSON report you can screenshot.
+The script writes:
+
+- `state.json` (contains keys; do not share)
+- `report.json` (safe demo artifact: tx hashes, explorer links, policy denial evidence)
+
+You can override the report path with `REPORT_PATH=...`.
 
 ## Notes
 
@@ -70,3 +76,4 @@ The script writes a local `state.json` (contains keys; do not share) and prints 
 - If AVNU rate-limits, lower `CONCURRENCY`.
 - If you want to declare the SessionAccount class from source, set `DECLARE_SESSION_ACCOUNT_CLASS=1` (requires `scarb`).
 - In DFNS mode, session keys are pinned by keyId and must match on-chain registered session pubkeys.
+- Oversized deny-attempt amount is controlled by `DENY_AMOUNT_MULTIPLIER` (default `10`).
